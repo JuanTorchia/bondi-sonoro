@@ -1,0 +1,39 @@
+{
+  "name": "bondi-sonoro",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sonificación en tiempo real de los colectivos de Buenos Aires. Capítulo 2 de la serie 'Datos abiertos + creatividad'.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "gtfs:fetch": "tsx scripts/build-routes.ts"
+  },
+  "dependencies": {
+    "next": "^15.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "tone": "^15.0.4",
+    "framer-motion": "^11.15.0",
+    "clsx": "^2.1.1",
+    "tailwind-merge": "^2.5.4",
+    "lucide-react": "^0.468.0",
+    "@turf/turf": "^7.2.0",
+    "d3-geo": "^3.1.1"
+  },
+  "devDependencies": {
+    "@types/d3-geo": "^3.1.0",
+    "@types/node": "^22.10.2",
+    "@types/react": "^19.0.2",
+    "@types/react-dom": "^19.0.2",
+    "typescript": "^5.7.2",
+    "tailwindcss": "^4.0.0-beta.7",
+    "@tailwindcss/postcss": "^4.0.0-beta.7",
+    "postcss": "^8.4.49",
+    "tsx": "^4.19.2",
+    "adm-zip": "^0.5.16",
+    "@types/adm-zip": "^0.5.7"
+  },
+  "packageManager": "pnpm@9.12.3"
+}

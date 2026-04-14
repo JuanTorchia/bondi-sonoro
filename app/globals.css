@@ -1,0 +1,79 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", Menlo, monospace;
+
+  --color-bg: #000000;
+  --color-bg-soft: #0a0a10;
+  --color-fg: #f5f5f7;
+  --color-muted: #6b6b7a;
+  --color-border: #1c1c26;
+  --color-accent: #fbbf24;
+  --color-accent-glow: #fde68a;
+}
+
+@layer base {
+  html,
+  body {
+    background: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+
+  ::selection {
+    background: var(--color-accent);
+    color: #000;
+  }
+}
+
+@layer utilities {
+  /* Glow neon para los strokes SVG de las cuerdas. */
+  .string-glow {
+    filter: drop-shadow(0 0 4px currentColor) drop-shadow(0 0 12px currentColor);
+  }
+
+  .string-glow-strong {
+    filter: drop-shadow(0 0 8px currentColor) drop-shadow(0 0 20px currentColor)
+      drop-shadow(0 0 36px currentColor);
+  }
+
+  /* Textura sutil de scan-lines para el vibe retro-juego */
+  .scanlines {
+    background-image: repeating-linear-gradient(
+      0deg,
+      transparent 0,
+      transparent 2px,
+      rgba(255, 255, 255, 0.015) 2px,
+      rgba(255, 255, 255, 0.015) 3px
+    );
+  }
+
+  /* Vignette hacia los bordes para centrar la mirada */
+  .vignette::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: radial-gradient(ellipse at center, transparent 50%, rgba(0, 0, 0, 0.75) 100%);
+  }
+}
+
+@keyframes pluck-ring {
+  0% {
+    r: 0;
+    opacity: 0.9;
+    stroke-width: 3;
+  }
+  80% {
+    opacity: 0.3;
+    stroke-width: 1;
+  }
+  100% {
+    r: 40;
+    opacity: 0;
+    stroke-width: 0.5;
+  }
+}
