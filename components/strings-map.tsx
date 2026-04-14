@@ -73,7 +73,13 @@ const VIEW_PADDING = 40;
 
 const POLL_MS = 30_000;      // polling al /api/positions
 const TICK_MS = 1000 / 30;   // 30fps para interpolación
-const PROGRESS_THRESHOLD = 0.005; // cambio mínimo para disparar pluck (~0.5% del recorrido)
+// Umbral acumulado de progreso desde el último pluck de ESE bondi. Al 0.3%
+// del recorrido (~30m en una línea de 10km) el bondi ya avanzó lo suficiente
+// para merecer otro punteo. Lo medimos contra el último "pluck progress" del
+// vehículo, no contra el frame anterior — así el smoothing puede ir chico y
+// la acumulación igual suma.
+const PLUCK_DELTA = 0.003;
+const MAX_SNAP_DISTANCE_PX = 180; // si el GPS cae más lejos, ignoramos el bondi
 
 export function StringsMap({ routes, playing, muted, onPluck, onVehiclesUpdate, engineRef }: Props) {
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -153,8 +159,7 @@ export function StringsMap({ routes, playing, muted, onPluck, onVehiclesUpdate, 
         const [px, py] = project(v.lat, v.lon);
         const snap = nearestOnPolyline(px, py, pLine.screen);
 
-        // Ignoramos vehículos que están a >80px de su ruta (datos ruidosos)
-        if (snap.distance > 80) continue;
+        if (snap.distance > MAX_SNAP_DISTANCE_PX) continue;
         activeCount++;
         seen.add(v.id);
 
@@ -165,10 +170,15 @@ export function StringsMap({ routes, playing, muted, onPluck, onVehiclesUpdate, 
           prev.speed = v.speed;
           prev.headsign = v.headsign;
         } else {
+          // Bondi recién aparecido: arrancamos desde "un poco atrás" del
+          // target para que la interpolación tenga distancia que recorrer
+          // y dispare plucks desde el primer segundo. Si arranca exactamente
+          // en el target, no suena hasta el próximo update.
+          const startProgress = Math.max(0, snap.progress - 0.01);
           vehiclesRef.current.set(v.id, {
             id: v.id,
             lineShort: v.lineShort,
-            progress: snap.progress,
+            progress: startProgress,
             targetProgress: snap.progress,
             lastUpdate: now,
             speed: v.speed,
@@ -205,8 +215,11 @@ export function StringsMap({ routes, playing, muted, onPluck, onVehiclesUpdate, 
       return;
     }
 
-    const previousProgress = new Map<string, number>();
-    const recentPlucks = new Map<string, number>(); // lineShort → timestamp
+    // Progreso en el que ocurrió el último pluck de CADA bondi.
+    // Comparamos contra esto, no contra el frame anterior — así la
+    // acumulación de pequeñas transiciones eventualmente cruza el umbral.
+    const lastPluckProgress = new Map<string, number>();
+    const recentLinePlucks = new Map<string, number>(); // lineShort → timestamp (anti-spam por línea)
 
     function tick() {
       const now = performance.now();
@@ -214,41 +227,47 @@ export function StringsMap({ routes, playing, muted, onPluck, onVehiclesUpdate, 
       const wobbles = new Map<string, number>();
 
       for (const state of vehiclesRef.current.values()) {
-        // Interpolamos progreso lentamente hacia target (suavizado exponencial)
+        // Smoothing exponencial hacia target
         const diff = state.targetProgress - state.progress;
         if (Math.abs(diff) > 0.00001) {
-          state.progress += diff * 0.035; // constante de smooth
+          state.progress += diff * 0.08;
         }
 
-        const prev = previousProgress.get(state.id) ?? state.progress;
-        const delta = Math.abs(state.progress - prev);
+        // Primer frame de este vehículo: anotamos y no plucks todavía
+        if (!lastPluckProgress.has(state.id)) {
+          lastPluckProgress.set(state.id, state.progress);
+          continue;
+        }
 
-        if (delta > PROGRESS_THRESHOLD) {
-          // Anti-spam: máximo un pluck por línea cada 400ms
-          const lastPluck = recentPlucks.get(state.lineShort) ?? 0;
-          if (now - lastPluck > 400) {
+        const sinceLastPluck = Math.abs(state.progress - lastPluckProgress.get(state.id)!);
+
+        if (sinceLastPluck > PLUCK_DELTA) {
+          // Anti-spam por línea: máximo un pluck cada 250ms en la misma cuerda
+          const lastLinePluck = recentLinePlucks.get(state.lineShort) ?? 0;
+          if (now - lastLinePluck > 250) {
             const pLine = linesByShort.get(state.lineShort);
             if (pLine) {
               const [px, py] = positionAtProgress(pLine.screen, state.progress);
-              const color = pLine.line.color;
               plucksToFire.push({
                 id: `${state.id}-${now.toFixed(0)}`,
                 lineShort: state.lineShort,
                 x: px,
                 y: py,
-                color,
+                color: pLine.line.color,
               });
-              recentPlucks.set(state.lineShort, now);
+              recentLinePlucks.set(state.lineShort, now);
 
-              const intensity = Math.min(1, state.speed / 15);
+              // Intensity: bondi parado (speed=0 reportado) igual suena, pero bajo.
+              // Con speed > 10 m/s (~36km/h) ya está a intensidad máxima.
+              const intensity = Math.max(0.35, Math.min(1, state.speed / 10));
               engineRef.current?.pluck(state.lineShort, pLine.line.note, intensity);
               onPluck?.(state.lineShort);
 
               wobbles.set(state.lineShort, Math.max(wobbles.get(state.lineShort) ?? 0, intensity));
             }
           }
+          lastPluckProgress.set(state.id, state.progress);
         }
-        previousProgress.set(state.id, state.progress);
       }
 
       if (plucksToFire.length > 0) {
