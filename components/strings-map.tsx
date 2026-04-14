@@ -53,6 +53,8 @@ interface VehicleState {
   headsign: string;
   /** dirección en el feed: 0 ida / 1 vuelta. Usamos para sign de avance. */
   direction: number;
+  /** progreso del último auto-pluck (para rítmica sobre la propia cuerda) */
+  lastSelfPluckProgress: number;
 }
 
 interface PluckEvent {
@@ -76,6 +78,17 @@ const TICK_MS = 1000 / 30;
 const DEFAULT_SPEED_MS = 4; // ~14 km/h
 const MAX_SNAP_DISTANCE_PX = 180;
 const SERVER_CORRECTION_RATE = 0.02; // cuánto del drift se corrige por frame
+
+/**
+ * Auto-pluck: cada cuánto (% de recorrido propio) el bondi puntea SU propia
+ * cuerda. Piensa en un bajo tumbao: la cuerda propia aporta pulso, las
+ * intersecciones aportan melodía.
+ *
+ * 0.012 ≈ cada ~120 m para una ruta de 10 km. Con speed real (~6 m/s) sale
+ * un pluck propio cada ~20 s por bondi. Con muchos bondis, se empasta en
+ * un ritmo denso y constante.
+ */
+const SELF_PLUCK_INTERVAL = 0.012;
 
 export function StringsMap({ routes, playing, muted, onPluck, onVehiclesUpdate, engineRef }: Props) {
   const vehiclesRef = useRef<Map<string, VehicleState>>(new Map());
@@ -181,6 +194,7 @@ export function StringsMap({ routes, playing, muted, onPluck, onVehiclesUpdate, 
             lastUpdate: now,
             headsign: v.headsign,
             direction: v.direction,
+            lastSelfPluckProgress: snap.progress,
           });
         }
       }
@@ -208,12 +222,33 @@ export function StringsMap({ routes, playing, muted, onPluck, onVehiclesUpdate, 
     if (!playing) return;
 
     const recentLinePlucks = new Map<string, number>(); // anti-spam por línea
+    const globalPluckTimestamps: number[] = [];         // rate limit global
 
     lastFrameTimeRef.current = performance.now();
 
+    /**
+     * Registra un pluck respetando anti-spam por-línea Y rate limit global.
+     * El rate limit evita que cuando llegue un poll y varios bondis crucen
+     * intersecciones simultáneamente suenen 20 notas juntas como un acorde
+     * extraño. Lo suavizamos a un máximo de 12 plucks/segundo.
+     */
+    function canPluck(lineShort: string, now: number, minGap = 180): boolean {
+      while (globalPluckTimestamps.length > 0 && globalPluckTimestamps[0] < now - 1000) {
+        globalPluckTimestamps.shift();
+      }
+      if (globalPluckTimestamps.length >= 12) return false;
+
+      const lastOnLine = recentLinePlucks.get(lineShort) ?? 0;
+      if (now - lastOnLine < minGap) return false;
+
+      recentLinePlucks.set(lineShort, now);
+      globalPluckTimestamps.push(now);
+      return true;
+    }
+
     function tick() {
       const now = performance.now();
-      const dt = Math.min(0.2, (now - lastFrameTimeRef.current) / 1000); // seg, clamp 200ms
+      const dt = Math.min(0.2, (now - lastFrameTimeRef.current) / 1000);
       lastFrameTimeRef.current = now;
 
       const plucksToFire: PluckEvent[] = [];
@@ -223,40 +258,21 @@ export function StringsMap({ routes, playing, muted, onPluck, onVehiclesUpdate, 
         const pLine = linesByShort.get(state.lineShort);
         if (!pLine) continue;
 
-        const previousProgress = state.progress;
-
-        // ────── SIMULACIÓN DE AVANCE ──────
-        // Avanzamos según speed reportada (m/s). Si speed=0 asumimos un mínimo
-        // para que el bondi no quede congelado en pantalla cuando en realidad
-        // suele estar moviéndose (speed=0 en el feed suele ser "sensor dormido").
+        // ────── FASE 1: avance "real" por simulación ──────
+        // Este es el ÚNICO movimiento que dispara plucks. Frame a frame,
+        // continuo, basado en speed real.
         const effectiveSpeed = Math.max(state.speed, DEFAULT_SPEED_MS);
         const progressDelta = (effectiveSpeed * dt) / pLine.meters;
-        // direction 0 = ida (avance), 1 = vuelta (retroceso en nuestra polyline)
         const sign = state.direction === 1 ? -1 : 1;
-        let nextProgress = state.progress + sign * progressDelta;
+        const simulatedProgress = state.progress + sign * progressDelta;
 
-        // ────── CORRECCIÓN HACIA EL REPORTE DEL SERVER ──────
-        // Dejamos que la simulación dibuje la trayectoria, pero cada frame
-        // empujamos suavemente hacia el último report. Así el bondi no se va
-        // de mambo si nuestra simulación se desalinea con lo que hace en vivo.
-        const drift = state.serverProgress - nextProgress;
-        nextProgress += drift * SERVER_CORRECTION_RATE;
+        const simFrom = Math.min(state.progress, simulatedProgress);
+        const simTo = Math.max(state.progress, simulatedProgress);
 
-        // Clamp [0, 1] con wrap-around en los extremos (si se pasa, queda)
-        nextProgress = Math.max(0, Math.min(1, nextProgress));
-        state.progress = nextProgress;
-
-        // ────── DETECCIÓN DE INTERSECCIONES ──────
-        const from = Math.min(previousProgress, nextProgress);
-        const to = Math.max(previousProgress, nextProgress);
-        const crossed = intersectionsCrossed(intersectionIndex, state.lineShort, from, to);
-
+        // Intersecciones cruzadas → pluck en la OTRA cuerda
+        const crossed = intersectionsCrossed(intersectionIndex, state.lineShort, simFrom, simTo);
         for (const hit of crossed) {
-          // Anti-spam por línea cruzada: máximo un pluck cada 200ms en ESA cuerda
-          const otherLast = recentLinePlucks.get(hit.other) ?? 0;
-          if (now - otherLast < 200) continue;
-          recentLinePlucks.set(hit.other, now);
-
+          if (!canPluck(hit.other, now)) continue;
           const otherLine = linesByShort.get(hit.other);
           if (!otherLine) continue;
 
@@ -267,13 +283,43 @@ export function StringsMap({ routes, playing, muted, onPluck, onVehiclesUpdate, 
             y: hit.point[1],
             color: otherLine.line.color,
           });
-
-          const intensity = Math.max(0.4, Math.min(1, state.speed / 10));
+          const intensity = Math.max(0.5, Math.min(1, state.speed / 10));
           engineRef.current?.pluck(hit.other, otherLine.line.note, intensity);
           onPluck?.(hit.other);
-
           wobbles.set(hit.other, Math.max(wobbles.get(hit.other) ?? 0, intensity));
         }
+
+        // Auto-pluck sobre la propia cuerda cada SELF_PLUCK_INTERVAL de avance.
+        // Esto da RITMO (la intersección da melodía).
+        const advancedSinceSelf = Math.abs(simulatedProgress - state.lastSelfPluckProgress);
+        if (advancedSinceSelf > SELF_PLUCK_INTERVAL) {
+          if (canPluck(state.lineShort, now, 260)) {
+            const [sx, sy] = positionAtProgress(pLine.screen, simulatedProgress);
+            plucksToFire.push({
+              id: `s-${state.id}-${now.toFixed(0)}`,
+              lineShort: state.lineShort,
+              x: sx,
+              y: sy,
+              color: pLine.line.color,
+              sympathetic: true,
+            });
+            const intensity = Math.max(0.25, Math.min(0.55, state.speed / 14));
+            engineRef.current?.pluck(state.lineShort, pLine.line.note, intensity);
+            wobbles.set(
+              state.lineShort,
+              Math.max(wobbles.get(state.lineShort) ?? 0, intensity * 0.5)
+            );
+          }
+          state.lastSelfPluckProgress = simulatedProgress;
+        }
+
+        // ────── FASE 2: corrección hacia serverProgress ──────
+        // Este salto NO dispara plucks — solo re-centra suavemente la posición
+        // para que no deriva de la realidad. Aislar esta fase resuelve el
+        // problema de "todo suena de golpe" cuando llega el poll cada 30s.
+        const drift = state.serverProgress - simulatedProgress;
+        const corrected = simulatedProgress + drift * SERVER_CORRECTION_RATE;
+        state.progress = Math.max(0, Math.min(1, corrected));
       }
 
       if (plucksToFire.length > 0) {
