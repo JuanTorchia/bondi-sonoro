@@ -26,6 +26,20 @@ export interface Viewport {
 }
 
 const EARTH_COS_BA = Math.cos((-34.6 * Math.PI) / 180);
+const METERS_PER_DEG_LAT = 111_320;
+
+/** Longitud aproximada en metros de una polyline lat/lon en la latitud de BA. */
+export function polylineMeters(shape: ReadonlyArray<readonly [number, number]>): number {
+  let total = 0;
+  for (let i = 0; i < shape.length - 1; i++) {
+    const [lat1, lon1] = shape[i];
+    const [lat2, lon2] = shape[i + 1];
+    const dLat = (lat2 - lat1) * METERS_PER_DEG_LAT;
+    const dLon = (lon2 - lon1) * METERS_PER_DEG_LAT * EARTH_COS_BA;
+    total += Math.hypot(dLat, dLon);
+  }
+  return total;
+}
 
 export function makeProjector(bbox: Bbox, viewport: Viewport) {
   const { minLat, maxLat, minLon, maxLon } = bbox;

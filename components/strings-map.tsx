@@ -3,9 +3,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { PositionPayload } from "@/app/api/positions/route";
-import type { CuratedLine } from "@/lib/curated-lines";
-import { makeProjector, nearestOnPolyline } from "@/lib/projection";
+import { makeProjector, nearestOnPolyline, polylineMeters } from "@/lib/projection";
 import { ConductorEngine } from "@/lib/sonify";
+import { buildIntersectionIndex, intersectionsCrossed, type IntersectionIndex } from "@/lib/intersections";
 
 interface Line {
   routeShortName: string;
@@ -34,24 +34,25 @@ interface Props {
 
 interface ProjectedLine {
   line: Line;
-  /** polyline en coords pantalla */
-  screen: Array<[number, number]>;
-  /** total length en px — para posicionar bondis */
-  totalLength: number;
+  screen: Array<[number, number]>;       // polyline en pantalla
+  screenLength: number;                  // longitud total en px
+  meters: number;                        // longitud real en metros
 }
 
 interface VehicleState {
   id: string;
   lineShort: string;
-  /** progreso actual interpolado 0..1 sobre la polyline */
+  /** progreso actual interpolado/simulado 0..1 */
   progress: number;
-  /** progreso target tras el último update del server */
-  targetProgress: number;
-  /** timestamp del último update */
-  lastUpdate: number;
-  /** velocidad reportada (m/s) */
+  /** último progreso conocido del feed — usado para corregir drift */
+  serverProgress: number;
+  /** speed reportada (m/s) */
   speed: number;
+  /** timestamp del último update del server */
+  lastUpdate: number;
   headsign: string;
+  /** dirección en el feed: 0 ida / 1 vuelta. Usamos para sign de avance. */
+  direction: number;
 }
 
 interface PluckEvent {
@@ -60,71 +61,76 @@ interface PluckEvent {
   x: number;
   y: number;
   color: string;
+  /** si es rebote en intersección, suena más sutil */
+  sympathetic?: boolean;
 }
 
-/**
- * VIEWPORT interno — SVG virtual de 1200x900. El CSS se encarga de escalar
- * a la pantalla real. Esto hace que los cálculos sean independientes del
- * tamaño real del container.
- */
 const VIEW_W = 1200;
 const VIEW_H = 900;
 const VIEW_PADDING = 40;
 
-const POLL_MS = 30_000;      // polling al /api/positions
-const TICK_MS = 1000 / 30;   // 30fps para interpolación
-// Umbral acumulado de progreso desde el último pluck de ESE bondi. Al 0.3%
-// del recorrido (~30m en una línea de 10km) el bondi ya avanzó lo suficiente
-// para merecer otro punteo. Lo medimos contra el último "pluck progress" del
-// vehículo, no contra el frame anterior — así el smoothing puede ir chico y
-// la acumulación igual suma.
-const PLUCK_DELTA = 0.003;
-const MAX_SNAP_DISTANCE_PX = 180; // si el GPS cae más lejos, ignoramos el bondi
+const POLL_MS = 30_000;
+const TICK_MS = 1000 / 30;
+
+/** Por defecto asumimos que un bondi "avanza" si no tenemos speed confiable. */
+const DEFAULT_SPEED_MS = 4; // ~14 km/h
+const MAX_SNAP_DISTANCE_PX = 180;
+const SERVER_CORRECTION_RATE = 0.02; // cuánto del drift se corrige por frame
 
 export function StringsMap({ routes, playing, muted, onPluck, onVehiclesUpdate, engineRef }: Props) {
-  const svgRef = useRef<SVGSVGElement | null>(null);
-  const rafRef = useRef<number | null>(null);
   const vehiclesRef = useRef<Map<string, VehicleState>>(new Map());
   const [pluckEvents, setPluckEvents] = useState<PluckEvent[]>([]);
   const [vehiclesSnapshot, setVehiclesSnapshot] = useState<VehicleState[]>([]);
   const [wobbleAmount, setWobbleAmount] = useState<Map<string, number>>(new Map());
+  const lastFrameTimeRef = useRef<number>(0);
 
-  // Proyección pre-computada (cambia solo si cambian las routes)
-  const projected: ProjectedLine[] = useMemo(() => {
-    const project = makeProjector(routes.globalBbox, {
+  // Proyección + métricas + intersecciones (memo: se recalculan solo si cambian las routes)
+  const { projected, linesByShort, pathsByLine, intersectionIndex, project } = useMemo(() => {
+    const projector = makeProjector(routes.globalBbox, {
       width: VIEW_W,
       height: VIEW_H,
       padding: VIEW_PADDING,
     });
-    return routes.lines.map((line) => {
-      const screen: Array<[number, number]> = line.shape.map(([lat, lon]) => project(lat, lon));
-      let total = 0;
+
+    const projected: ProjectedLine[] = routes.lines.map((line) => {
+      const screen: Array<[number, number]> = line.shape.map(([lat, lon]) => projector(lat, lon));
+      let screenLength = 0;
       for (let i = 0; i < screen.length - 1; i++) {
-        total += Math.hypot(screen[i + 1][0] - screen[i][0], screen[i + 1][1] - screen[i][1]);
+        screenLength += Math.hypot(screen[i + 1][0] - screen[i][0], screen[i + 1][1] - screen[i][1]);
       }
-      return { line, screen, totalLength: total };
+      return {
+        line,
+        screen,
+        screenLength,
+        meters: polylineMeters(line.shape),
+      };
     });
-  }, [routes]);
 
-  const linesByShort = useMemo(() => {
-    const map = new Map<string, ProjectedLine>();
-    for (const p of projected) map.set(p.line.routeShortName, p);
-    return map;
-  }, [projected]);
+    const linesByShort = new Map<string, ProjectedLine>();
+    for (const p of projected) linesByShort.set(p.line.routeShortName, p);
 
-  // Path SVG string por línea (memoizado)
-  const pathsByLine = useMemo(() => {
-    const map = new Map<string, string>();
+    const pathsByLine = new Map<string, string>();
     for (const p of projected) {
       const d = p.screen
         .map((pt, i) => `${i === 0 ? "M" : "L"}${pt[0].toFixed(2)} ${pt[1].toFixed(2)}`)
         .join(" ");
-      map.set(p.line.routeShortName, d);
+      pathsByLine.set(p.line.routeShortName, d);
     }
-    return map;
-  }, [projected]);
 
-  // Poll al proxy
+    const intersectionIndex: IntersectionIndex = buildIntersectionIndex(
+      projected.map((p) => ({ id: p.line.routeShortName, polyline: p.screen }))
+    );
+
+    if (typeof window !== "undefined") {
+      let totalCrossings = 0;
+      for (const arr of intersectionIndex.byLine.values()) totalCrossings += arr.length;
+      console.log(`[strings-map] ${projected.length} líneas, ${totalCrossings / 2} intersecciones únicas`);
+    }
+
+    return { projected, linesByShort, pathsByLine, intersectionIndex, project: projector };
+  }, [routes]);
+
+  // Poll al proxy — solo actualiza el "target" del server, no teletransporta
   useEffect(() => {
     if (!playing) return;
 
@@ -150,44 +156,36 @@ export function StringsMap({ routes, playing, muted, onPluck, onVehiclesUpdate, 
         const pLine = linesByShort.get(v.lineShort);
         if (!pLine) continue;
 
-        // Proyectamos lat/lon del vehículo a pantalla y snapeamos a la línea
-        const project = makeProjector(routes.globalBbox, {
-          width: VIEW_W,
-          height: VIEW_H,
-          padding: VIEW_PADDING,
-        });
         const [px, py] = project(v.lat, v.lon);
         const snap = nearestOnPolyline(px, py, pLine.screen);
-
         if (snap.distance > MAX_SNAP_DISTANCE_PX) continue;
         activeCount++;
         seen.add(v.id);
 
-        const prev = vehiclesRef.current.get(v.id);
-        if (prev) {
-          prev.targetProgress = snap.progress;
-          prev.lastUpdate = now;
-          prev.speed = v.speed;
-          prev.headsign = v.headsign;
+        const existing = vehiclesRef.current.get(v.id);
+        if (existing) {
+          // El server report es la verdad. Lo guardamos aparte y corregimos
+          // el progress simulado suavemente hacia él (anti-teletransporte).
+          existing.serverProgress = snap.progress;
+          existing.speed = v.speed;
+          existing.lastUpdate = now;
+          existing.headsign = v.headsign;
+          existing.direction = v.direction;
         } else {
-          // Bondi recién aparecido: arrancamos desde "un poco atrás" del
-          // target para que la interpolación tenga distancia que recorrer
-          // y dispare plucks desde el primer segundo. Si arranca exactamente
-          // en el target, no suena hasta el próximo update.
-          const startProgress = Math.max(0, snap.progress - 0.01);
           vehiclesRef.current.set(v.id, {
             id: v.id,
             lineShort: v.lineShort,
-            progress: startProgress,
-            targetProgress: snap.progress,
-            lastUpdate: now,
+            progress: snap.progress,
+            serverProgress: snap.progress,
             speed: v.speed,
+            lastUpdate: now,
             headsign: v.headsign,
+            direction: v.direction,
           });
         }
       }
 
-      // Limpiamos vehículos que no aparecieron en este update hace >2 minutos
+      // Limpieza de vehículos que no aparecieron en >2 minutos
       for (const [id, state] of vehiclesRef.current) {
         if (!seen.has(id) && now - state.lastUpdate > 120_000) {
           vehiclesRef.current.delete(id);
@@ -203,109 +201,122 @@ export function StringsMap({ routes, playing, muted, onPluck, onVehiclesUpdate, 
       cancelled = true;
       clearInterval(interval);
     };
-  }, [playing, linesByShort, routes.globalBbox, onVehiclesUpdate]);
+  }, [playing, linesByShort, project, onVehiclesUpdate]);
 
-  // Loop de animación + detección de cruces → pluck
+  // Loop principal: simulación de avance + detección de intersecciones cruzadas
   useEffect(() => {
-    if (!playing) {
-      if (rafRef.current !== null) {
-        clearInterval(rafRef.current);
-        rafRef.current = null;
-      }
-      return;
-    }
+    if (!playing) return;
 
-    // Progreso en el que ocurrió el último pluck de CADA bondi.
-    // Comparamos contra esto, no contra el frame anterior — así la
-    // acumulación de pequeñas transiciones eventualmente cruza el umbral.
-    const lastPluckProgress = new Map<string, number>();
-    const recentLinePlucks = new Map<string, number>(); // lineShort → timestamp (anti-spam por línea)
+    const recentLinePlucks = new Map<string, number>(); // anti-spam por línea
+
+    lastFrameTimeRef.current = performance.now();
 
     function tick() {
       const now = performance.now();
+      const dt = Math.min(0.2, (now - lastFrameTimeRef.current) / 1000); // seg, clamp 200ms
+      lastFrameTimeRef.current = now;
+
       const plucksToFire: PluckEvent[] = [];
       const wobbles = new Map<string, number>();
 
       for (const state of vehiclesRef.current.values()) {
-        // Smoothing exponencial hacia target
-        const diff = state.targetProgress - state.progress;
-        if (Math.abs(diff) > 0.00001) {
-          state.progress += diff * 0.08;
-        }
+        const pLine = linesByShort.get(state.lineShort);
+        if (!pLine) continue;
 
-        // Primer frame de este vehículo: anotamos y no plucks todavía
-        if (!lastPluckProgress.has(state.id)) {
-          lastPluckProgress.set(state.id, state.progress);
-          continue;
-        }
+        const previousProgress = state.progress;
 
-        const sinceLastPluck = Math.abs(state.progress - lastPluckProgress.get(state.id)!);
+        // ────── SIMULACIÓN DE AVANCE ──────
+        // Avanzamos según speed reportada (m/s). Si speed=0 asumimos un mínimo
+        // para que el bondi no quede congelado en pantalla cuando en realidad
+        // suele estar moviéndose (speed=0 en el feed suele ser "sensor dormido").
+        const effectiveSpeed = Math.max(state.speed, DEFAULT_SPEED_MS);
+        const progressDelta = (effectiveSpeed * dt) / pLine.meters;
+        // direction 0 = ida (avance), 1 = vuelta (retroceso en nuestra polyline)
+        const sign = state.direction === 1 ? -1 : 1;
+        let nextProgress = state.progress + sign * progressDelta;
 
-        if (sinceLastPluck > PLUCK_DELTA) {
-          // Anti-spam por línea: máximo un pluck cada 250ms en la misma cuerda
-          const lastLinePluck = recentLinePlucks.get(state.lineShort) ?? 0;
-          if (now - lastLinePluck > 250) {
-            const pLine = linesByShort.get(state.lineShort);
-            if (pLine) {
-              const [px, py] = positionAtProgress(pLine.screen, state.progress);
-              plucksToFire.push({
-                id: `${state.id}-${now.toFixed(0)}`,
-                lineShort: state.lineShort,
-                x: px,
-                y: py,
-                color: pLine.line.color,
-              });
-              recentLinePlucks.set(state.lineShort, now);
+        // ────── CORRECCIÓN HACIA EL REPORTE DEL SERVER ──────
+        // Dejamos que la simulación dibuje la trayectoria, pero cada frame
+        // empujamos suavemente hacia el último report. Así el bondi no se va
+        // de mambo si nuestra simulación se desalinea con lo que hace en vivo.
+        const drift = state.serverProgress - nextProgress;
+        nextProgress += drift * SERVER_CORRECTION_RATE;
 
-              // Intensity: bondi parado (speed=0 reportado) igual suena, pero bajo.
-              // Con speed > 10 m/s (~36km/h) ya está a intensidad máxima.
-              const intensity = Math.max(0.35, Math.min(1, state.speed / 10));
-              engineRef.current?.pluck(state.lineShort, pLine.line.note, intensity);
-              onPluck?.(state.lineShort);
+        // Clamp [0, 1] con wrap-around en los extremos (si se pasa, queda)
+        nextProgress = Math.max(0, Math.min(1, nextProgress));
+        state.progress = nextProgress;
 
-              wobbles.set(state.lineShort, Math.max(wobbles.get(state.lineShort) ?? 0, intensity));
-            }
-          }
-          lastPluckProgress.set(state.id, state.progress);
+        // ────── DETECCIÓN DE INTERSECCIONES ──────
+        const from = Math.min(previousProgress, nextProgress);
+        const to = Math.max(previousProgress, nextProgress);
+        const crossed = intersectionsCrossed(intersectionIndex, state.lineShort, from, to);
+
+        for (const hit of crossed) {
+          // Anti-spam por línea cruzada: máximo un pluck cada 200ms en ESA cuerda
+          const otherLast = recentLinePlucks.get(hit.other) ?? 0;
+          if (now - otherLast < 200) continue;
+          recentLinePlucks.set(hit.other, now);
+
+          const otherLine = linesByShort.get(hit.other);
+          if (!otherLine) continue;
+
+          plucksToFire.push({
+            id: `x-${state.id}-${hit.other}-${now.toFixed(0)}`,
+            lineShort: hit.other,
+            x: hit.point[0],
+            y: hit.point[1],
+            color: otherLine.line.color,
+          });
+
+          const intensity = Math.max(0.4, Math.min(1, state.speed / 10));
+          engineRef.current?.pluck(hit.other, otherLine.line.note, intensity);
+          onPluck?.(hit.other);
+
+          wobbles.set(hit.other, Math.max(wobbles.get(hit.other) ?? 0, intensity));
         }
       }
 
       if (plucksToFire.length > 0) {
-        setPluckEvents((prev) => [...prev.slice(-20), ...plucksToFire]);
+        setPluckEvents((prev) => [...prev.slice(-25), ...plucksToFire]);
       }
       if (wobbles.size > 0) {
-        setWobbleAmount(new Map(wobbles));
+        setWobbleAmount(wobbles);
       }
 
-      // Snapshot de vehículos para render (no queremos rehacer a cada frame)
+      // Snapshot a ~15fps, suficiente para re-render de dots
       if (Math.floor(now / 66) !== Math.floor((now - TICK_MS) / 66)) {
         setVehiclesSnapshot(Array.from(vehiclesRef.current.values()));
       }
     }
 
     const id = setInterval(tick, TICK_MS);
-    rafRef.current = id as unknown as number;
     return () => clearInterval(id);
-  }, [playing, linesByShort, engineRef, onPluck]);
+  }, [playing, linesByShort, engineRef, onPluck, intersectionIndex]);
 
-  // Limpieza de pluck events tras su animación
+  // Limpieza periódica de pluck events
   useEffect(() => {
     if (pluckEvents.length === 0) return;
-    const t = setTimeout(() => setPluckEvents([]), 1000);
+    const t = setTimeout(() => setPluckEvents((prev) => prev.slice(-10)), 1200);
     return () => clearTimeout(t);
-  }, [pluckEvents.length]);
+  }, [pluckEvents]);
+
+  // Decay del wobble
+  useEffect(() => {
+    if (wobbleAmount.size === 0) return;
+    const t = setTimeout(() => setWobbleAmount(new Map()), 350);
+    return () => clearTimeout(t);
+  }, [wobbleAmount]);
 
   return (
     <div className="relative w-full aspect-[4/3] max-h-[75vh] overflow-hidden vignette">
       <svg
-        ref={svgRef}
         viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}
         preserveAspectRatio="xMidYMid meet"
         className="w-full h-full scanlines"
       >
-        {/* Cuerdas (polylines) */}
+        {/* Cuerdas */}
         {projected.map((p) => {
-          const muted_ = muted[p.line.routeShortName];
+          const isMuted = muted[p.line.routeShortName];
           const wobble = wobbleAmount.get(p.line.routeShortName) ?? 0;
           const d = pathsByLine.get(p.line.routeShortName);
           if (!d) return null;
@@ -315,23 +326,38 @@ export function StringsMap({ routes, playing, muted, onPluck, onVehiclesUpdate, 
               d={d}
               fill="none"
               stroke={p.line.color}
-              strokeWidth={1.2 + wobble * 1.4}
+              strokeWidth={1.2 + wobble * 1.8}
               strokeLinecap="round"
               strokeLinejoin="round"
-              opacity={muted_ ? 0.18 : 0.5 + wobble * 0.5}
+              opacity={isMuted ? 0.14 : 0.45 + wobble * 0.55}
               style={{
                 color: p.line.color,
-                filter: wobble > 0.3 ? "drop-shadow(0 0 6px currentColor) drop-shadow(0 0 18px currentColor)" : `drop-shadow(0 0 3px currentColor)`,
+                filter:
+                  wobble > 0.25
+                    ? "drop-shadow(0 0 8px currentColor) drop-shadow(0 0 22px currentColor)"
+                    : "drop-shadow(0 0 3px currentColor)",
               }}
-              animate={{
-                strokeWidth: 1.2 + wobble * 1.4,
-              }}
-              transition={{ duration: 0.25, ease: "easeOut" }}
+              animate={{ strokeWidth: 1.2 + wobble * 1.8 }}
+              transition={{ duration: 0.3, ease: "easeOut" }}
             />
           );
         })}
 
-        {/* Bondis animados — dots con glow */}
+        {/* Puntos de intersección — discretos pero visibles para entender el juego */}
+        {Array.from(intersectionIndex.byLine.entries()).flatMap(([lineId, arr]) =>
+          arr.map((x, i) => (
+            <circle
+              key={`int-${lineId}-${i}`}
+              cx={x.point[0]}
+              cy={x.point[1]}
+              r={1.6}
+              fill="#ffffff"
+              opacity={0.12}
+            />
+          ))
+        )}
+
+        {/* Bondis */}
         {vehiclesSnapshot.map((v) => {
           const pLine = linesByShort.get(v.lineShort);
           if (!pLine) return null;
@@ -349,7 +375,7 @@ export function StringsMap({ routes, playing, muted, onPluck, onVehiclesUpdate, 
           );
         })}
 
-        {/* Pluck rings — anillos que expanden y se desvanecen */}
+        {/* Pluck rings */}
         <AnimatePresence>
           {pluckEvents.map((p) => (
             <motion.circle
@@ -358,12 +384,12 @@ export function StringsMap({ routes, playing, muted, onPluck, onVehiclesUpdate, 
               cy={p.y}
               stroke={p.color}
               fill="none"
-              strokeWidth={2}
-              initial={{ r: 4, opacity: 0.9 }}
-              animate={{ r: 50, opacity: 0, strokeWidth: 0.5 }}
+              strokeWidth={2.2}
+              initial={{ r: 4, opacity: 0.95 }}
+              animate={{ r: 55, opacity: 0, strokeWidth: 0.5 }}
               exit={{ opacity: 0 }}
-              transition={{ duration: 0.9, ease: "easeOut" }}
-              style={{ color: p.color, filter: "drop-shadow(0 0 8px currentColor)" }}
+              transition={{ duration: 1.1, ease: "easeOut" }}
+              style={{ color: p.color, filter: "drop-shadow(0 0 10px currentColor)" }}
             />
           ))}
         </AnimatePresence>
@@ -379,7 +405,6 @@ function positionAtProgress(
   if (screen.length === 0) return [0, 0];
   if (screen.length === 1) return screen[0];
 
-  // Longitudes acumuladas
   const lens: number[] = [];
   let total = 0;
   for (let i = 0; i < screen.length - 1; i++) {
